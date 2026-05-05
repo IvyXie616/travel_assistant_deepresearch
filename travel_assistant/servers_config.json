@@ -1,0 +1,15 @@
+{
+    "mcpServers":{
+        "weather":{
+            "command":"python",
+            "args":["weather_server.py"],
+            "transport":"stdio"
+        },
+
+        "route":{
+            "command":"python",
+            "args":["route_server.py"],
+            "transport":"stdio"
+        }
+    }
+}
