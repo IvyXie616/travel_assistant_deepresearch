@@ -1,0 +1,40 @@
+# ============================================================
+# Multi-Agent Travel Assistant 依赖清单
+# 设计原则：最小依赖 + 版本锁定 + 生态一致
+# ============================================================
+
+# ---- LangChain 生态（1.x 代际，保持一致）----
+langchain==1.0.7
+langchain-core==1.0.5
+langchain-community==0.4.1
+langchain-chroma>=0.2.0
+langchain-text-splitters==1.0.0
+langchain-mcp-adapters==0.1.14
+
+# ---- LangGraph 工作流引擎 ----
+langgraph==1.0.3
+langgraph-checkpoint==3.0.1
+langgraph-prebuilt==1.0.4
+
+# ---- 向量数据库与嵌入 ----
+chromadb==0.5.23
+dashscope==1.25.1
+
+# ---- Web 框架 ----
+fastapi==0.123.0
+uvicorn==0.35.0
+sse-starlette==2.2.1
+
+# ---- 数据校验与配置 ----
+pydantic==2.12.4
+python-dotenv==1.1.0
+
+# ---- MCP 协议 ----
+mcp==1.12.1
+
+# ---- HTTP 客户端（MCP Server 调用外部 API）----
+requests==2.32.5
+
+# ---- 工具库 ----
+python-dateutil==2.9.0.post0
+tenacity==9.1.2

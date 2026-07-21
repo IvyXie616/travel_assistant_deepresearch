@@ -1,0 +1,14 @@
+{
+  "api_key": "",
+  "model": "qwen-turbo",
+  "max_iterations": 3,
+  "enable_memory": true,
+  "enable_rag": true,
+  "memory_db_path": "./app/data/memory.db",
+  "chroma_persist_dir": "./app/data/chroma",
+  "chroma_collection": "travel_memory",
+  "rag_collection": "travel_knowledge",
+  "mcp_config_path": "./servers_config.json",
+  "thread_id": "default",
+  "user_id": "default_user"
+}
