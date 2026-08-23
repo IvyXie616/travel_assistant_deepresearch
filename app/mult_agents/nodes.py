@@ -105,14 +105,21 @@ def invoke_json_agent(state:TravelState, prompt: str, agent, agent_name: str, no
     return load_json(content, fallback), content, [AIMessage(content=content, name=agent_name)]
 
 # planner 节点
-def planner_node(state:TravelState, agent, agent_name: str):
-    """planner 节点：解析用户需求，输出结构化旅行计划 JSON。
-
-    调用 planner LCEL 链，解析返回的 JSON，写入 state 的：
-    plan / sub_tasks / origin / destination / travel_dates /
-    needs_clarification / clarification_question
-    """
+def planner_node(state, agent, agent_name):
     prompt = state.get("query", "")
+    
+    # ⭐ 重规划时，附加反思反馈（让 LLM 知道为什么重规划）
+    if state.get("iteration", 0) > 0:
+        reflection = state.get("reflection", "")
+        risks = state.get("risk_warnings", [])
+        if reflection or risks:
+            prompt += (
+                f"\n\n[反思反馈]\n"
+                f"上一轮计划的反思：{reflection[:200]}\n"
+                f"风险提示：{json.dumps(risks, ensure_ascii=False)}\n"
+                f"请根据以上反思调整规划，避免同样的问题。"
+            )
+    
     data, content, msgs = invoke_json_agent(state, prompt, agent, agent_name, "planner", {})
     result = {
         "plan": content,
@@ -262,17 +269,25 @@ def budget_node(state:TravelState, agent, agent_name: str):
     """budget 节点：综合所有信息估算旅行预算。"""
     prompt = (
         f"请根据以下信息估算旅行预算：\n"
+        f"出发地：{state.get('origin', '')}\n"
         f"目的地：{state.get('destination', '')}\n"
         f"出行日期：{state.get('travel_dates', [])}\n"
         f"天气信息：{state.get('weather_info', '')}\n"
         f"交通信息：{state.get('transport_info', '')}\n"
         f"酒店信息：{state.get('hotel_info', '')}\n"
-        f"地理距离矩阵：{json.dumps(state.get('geo_matrix', {}), ensure_ascii=False)}\n"
     )
     data, content, msgs = invoke_json_agent(
         state, prompt, agent, agent_name, "budget", {}
     )
-    return {"budget_info": content, "messages": msgs}
+    budget = data.get("total", 0)
+    too_expensive = data.get("too_expensive", False)
+    result = {"budget_info": content, "messages": msgs}
+    
+    if too_expensive:
+        warnings = state.get("risk_warnings",[])
+        warnings.append(f"预算为{budget}元，有可能超出可接受范围")
+        result["risk_warnings"] = warnings
+    return result
 
 def reflection_node(state:TravelState, agent, agent_name: str):
     """reflection 节点：反思计划完整性，判断是否需要重规划。"""
@@ -284,37 +299,78 @@ def reflection_node(state:TravelState, agent, agent_name: str):
         f"交通信息：{state.get('transport_info', '')}\n"
         f"酒店信息：{state.get('hotel_info', '')}\n"
         f"预算信息：{state.get('budget_info', '')}\n"
-        f"当前迭代：{state.get('iteration', 0)}/{state.get('max_iterations', 3)}\n"
+        f"地理距离矩阵：{json.dumps(state.get('geo_matrix', {}), ensure_ascii=False)}\n"
+        f"当前隐患：{json.dumps(state.get('risk_warnings', []), ensure_ascii=False)}\n"
     )
+    # ⭐ 重规划时，附加反思反馈（让 LLM 知道为什么重规划）
+    if state.get("iteration", 0) > 0:
+        reflection = state.get("reflection", "")
+        if reflection:
+            prompt += (
+                f"\n\n[反思反馈]\n"
+                f"上一轮计划的反思：{reflection[:200]}\n"
+                f"请根据以上反思调整规划，避免同样的问题。"
+            )
+    
     data, content, msgs = invoke_json_agent(
         state, prompt, agent, agent_name, "reflection", {}
     )
+    risk_warnings = data.get("risks", [])
+    need_replan = data.get("needs_replan", False)
+    reason = data.get("reason", "")
+    for route, dis in state.get("geo_matrix",{}).items():
+        if dis > 5.0:
+            risk_warnings.append(f"空间不连贯：{route} 距离 {dis}km")
+            need_replan = True
+
     return {
         "reflection": content,
-        "needs_replan": data.get("needs_replan", False),
-        "risk_warnings": data.get("risk_warnings", []),
+        "needs_replan": need_replan,
+        "risk_warnings": risk_warnings,
         "iteration": state.get("iteration", 0) + 1,
         "messages": msgs,
     }
 
-def write_node(state:TravelState, agent, agent_name: str):
+def write_node(state:TravelState, structured_agent, fallback_agent, agent_name: str):
     """write 节点：生成最终旅行计划。"""
     prompt = (
-        f"请根据以下信息生成完整的旅行计划：\n"
+        f"请根据以下信息生成完整的旅行计划。\n"
+        f"注意，基于地理距离矩阵信息和交通信息，在计划中添加空间连贯描述（如'下车后步行15分钟到酒店'）：\n"
         f"用户需求：{state.get('query', '')}\n"
-        f"出行日期：{state.get('travel_dates', [])}\n"
+        f"出行日期：{json.dumps(state.get('travel_dates', []),ensure_ascii=False)}\n"
         f"出发地：{state.get('origin', '')}\n"
         f"目的地：{state.get('destination', '')}\n"
         f"天气信息：{state.get('weather_info', '')}\n"
         f"交通信息：{state.get('transport_info', '')}\n"
         f"酒店信息：{state.get('hotel_info', '')}\n"
         f"预算信息：{state.get('budget_info', '')}\n"
-        f"风险提示：{state.get('risk_warnings', [])}\n"
+        f"风险提示：{json.dumps(state.get('risk_warnings', []),ensure_ascii=False)}\n"
+        f"地理距离矩阵：{json.dumps(state.get('geo_matrix', {}), ensure_ascii=False)}"
     )
-    data, content, msgs = invoke_json_agent(
-        state, prompt, agent, agent_name, "write", {}
-    )
-    return {"final": content, "draft": content, "messages": msgs}
+    memo_prompt = with_memory_context(state, prompt)
+    
+    try:
+        # ⭐ 结构化输出：返回 TravelPlan 对象（不是 AIMessage）
+        plan = structured_agent.invoke({"input": memo_prompt})
+        content = plan.model_dump_json(indent=2)
+        logger.info("[write] 结构化输出成功 | itinerary=%d天 hotels=%d", 
+                    len(plan.itinerary), len(plan.hotels))
+        return {
+            "final": content,
+            "draft": content,
+            "messages": [AIMessage(content=content, name=agent_name)],
+        }
+    except Exception as e:
+        logger.error("[write] 结构化输出失败: %s，降级为文本输出", e)
+        # ⭐ 降级路径：用原始 LCEL 链生成文本
+        result = fallback_agent.invoke({"input": memo_prompt})
+        content = result.content
+        logger.info("[write] 降级输出成功 | 输出长度: %d", len(content))
+        return {
+            "final": content,
+            "draft": content,
+            "messages": [AIMessage(content=content, name=agent_name)],
+        }
 
 def research_node(state:TravelState, agent, agent_name:str):
     """research节点，调用RAG知识库搜索信息"""
@@ -330,7 +386,7 @@ def research_node(state:TravelState, agent, agent_name:str):
     
     lines = []
     for i, r in enumerate(records, 1):
-        lines.append(f"{i}.{r["content"]}")
+        lines.append(f"{i}.{r['content']}")
     l = '\n'.join(lines)
     prompt = (
         f"旅游地点：{dest}\n"

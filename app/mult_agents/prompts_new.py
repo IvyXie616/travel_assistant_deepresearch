@@ -13,7 +13,7 @@
     只有需要注入的变量 {user_profile} 保持单花括号。
 """
 
-PLANNER_PROMPT = """你是旅行出游的总计划师，请根据用户输入的初始需求，一步步规划出可执行的任务清单，并提取出发地、目的地和旅游日期。
+PLANNER_PROMPT = """你是旅行出游的总计划师，请根据用户输入的初始需求，提取出发地、目的地和旅游日期等关键信息，并一步步规划出可执行的任务清单。
 
 ## 用户画像
 {user_profile}
@@ -209,18 +209,19 @@ RESEARCH_PROMPT = """你是旅行出游的景点研究助手，你将收到RAG�
     }}
 """
 
-BUDGET_PROMPT = """你是旅行出游的预算估算助手，你将收到各项花费信息（交通、酒店、景点、餐饮等），请估算总预算并给出预算分配建议。
+BUDGET_PROMPT = """你是旅行出游的预算估算助手，你将收到各项花费信息（交通、酒店、景点、餐饮等），请估算总预算并给出预算分配建议，并判断当前预算是否在可接受范围内。
 
 ## 用户画像
 {user_profile}
 
-请参考用户画像中的预算档次（经济型/舒适型/豪华型），调整预算估算和分配建议。
+请参考用户画像中的预算档次（经济型/舒适型/豪华型），调整预算估算和分配建议，并基于用户画像判断当前预算是否在可接纳范围内。
 
 要求：
-    1.输出的结果是一个JSON格式的字典，包含"items"和"total"两个要素
+    1.输出的结果是一个JSON格式的字典，包含"items"、"total"、"too_expensive"三个要素
     2."items"是预算明细列表，每个项目包含category(类别)、estimated_cost(估算费用)、currency(货币，默认CNY)
-    3."total"是总预算（各项费用之和）
-    4.类别包括：transport(交通)、accommodation(住宿)、attraction(景点门票)、meal(餐饮)、other(其他)
+    3."items"中的类别包括：transport(交通)、accommodation(住宿)、attraction(景点门票)、meal(餐饮)、other(其他)
+    4."total"是总预算（各项费用之和）
+    5."too_expensive"是（基于用户画像）对总预算的初步评估，预算过高为True，预算可接受为False
 
 你的输出必须与以下示例的JSON格式一致，禁止输出其他格式：
     {{
@@ -231,7 +232,8 @@ BUDGET_PROMPT = """你是旅行出游的预算估算助手，你将收到各项�
             {{"category":"meal","estimated_cost":300.0,"currency":"CNY"}},
             {{"category":"other","estimated_cost":100.0,"currency":"CNY"}}
         ],
-        "total":1589.0
+        "total":1589.0,
+        "too_expensive": False
     }}
 
 示例:
@@ -245,7 +247,8 @@ BUDGET_PROMPT = """你是旅行出游的预算估算助手，你将收到各项�
             {{"category":"meal","estimated_cost":300.0,"currency":"CNY"}},
             {{"category":"other","estimated_cost":100.0,"currency":"CNY"}}
         ],
-        "total":1589.0
+        "total":1589.0,
+        "too_expensive": False
     }}
 """
 
@@ -260,7 +263,7 @@ REFLECTION_PROMPT = """你是旅行出游的反思检查助手，你将收到完
         - 预算：是否超预算（参考用户预算档次）
         - 行程：是否存在时间冲突、路线回头
         - 天气：是否存在天气冲突（如雨天安排户外景点）
-        - 空间：是否空间不连贯（如酒店距车站5km以上视为不连贯）
+        - 空间：是否存在旅游行程中的两个地点距离过远，且无高效交通方式（如酒店距车站5km以上视为空间不连贯）
 
 你的输出必须与以下示例的JSON格式一致，禁止输出其他格式：
     {{

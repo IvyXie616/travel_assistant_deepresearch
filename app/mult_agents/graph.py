@@ -59,7 +59,7 @@ def route_after_reflection(state:TravelState):
     - needs_replan=True 且未超迭代上限：回到 planner 重新规划
     - 否则：进入 write 生成最终计划
     """
-    if state["needs_replan"] and state["iteration"]<=state["max_iterations"]:
+    if state["needs_replan"] and state["iteration"]<state["max_iterations"]:
         return "planner"
     else:
         return "write"
@@ -90,7 +90,12 @@ def build_workflow(agents, checkpointer=None):
 
     workflow.add_node("budget", bind_agent(budget_node, agents.budget, "budget"))
     workflow.add_node("reflection", bind_agent(reflection_node, agents.reflection, "reflection"))
-    workflow.add_node("write", bind_agent(write_node, agents.writer, "write"))
+    workflow.add_node("write", functools.partial(
+        write_node,
+        structured_agent=agents.writer_structured,
+        fallback_agent=agents.writer,
+        agent_name="writer"
+    ))
 
     # 定义边
     workflow.add_edge(START, "intent")

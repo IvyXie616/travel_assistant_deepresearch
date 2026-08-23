@@ -15,7 +15,8 @@ from langchain_core.runnables import Runnable
 
 from app.mult_agents import prompts_new
 from app.mult_agents.config import AppConfig
-
+from langchain_core.language_models import BaseChatModel
+from .schemas.travel_plan import TravelPlan
 
 @dataclass
 class AgentBundle:
@@ -34,7 +35,7 @@ class AgentBundle:
     budget: Runnable
     reflection: Runnable
     writer: Runnable
-
+    writer_structured: Runnable
 
 def build_agent(
     model: str,
@@ -75,6 +76,30 @@ def build_agent(
     # {user_profile} 已由 partial 预填充（Phase 5 后由节点注入真实画像）
     return agent_template | llm
 
+def build_agent_structured(
+    model: str,
+    api_key: str,
+    prompt_key: str,
+    temperature: float = 0.7,
+) -> Runnable:
+    llm = ChatTongyi(
+        model=model,
+        temperature=temperature,
+        dashscope_api_key=api_key,
+    )
+
+    # 构造 ChatPromptTemplate，绑定 system prompt
+    # partial 预填充 user_profile（Phase 5 后由节点注入实际画像）；
+    # 节点编排模式下不绑定 tools，LLM 只负责基于工具输出做结构化总结
+    system_prompt = prompts_new.PROMPTS[prompt_key]
+    agent_template = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ]).partial(user_profile="（暂无用户画像）")
+    # LCEL 链：invoke 时传 {"input": "..."}，
+    # {user_profile} 已由 partial 预填充（Phase 5 后由节点注入真实画像）
+    return agent_template | llm.with_structured_output(TravelPlan)
+
 def build_agents(config: AppConfig) -> AgentBundle:
     """
     根据配置创建所有 Agent 并打包为 AgentBundle。
@@ -85,7 +110,6 @@ def build_agents(config: AppConfig) -> AgentBundle:
     """
     api = config.api_key
     model = config.model
-
     return AgentBundle(
         planner=build_agent(model, api, "planner", temperature=0.3),
         weather=build_agent(model, api, "weather", temperature=0.5),
@@ -95,4 +119,5 @@ def build_agents(config: AppConfig) -> AgentBundle:
         budget=build_agent(model, api, "budget", temperature=0.3),
         reflection=build_agent(model, api, "reflection", temperature=0.3),
         writer=build_agent(model, api, "writer", temperature=0.7),
+        writer_structured=build_agent_structured(model, api, "writer", temperature=0.7),
     )
