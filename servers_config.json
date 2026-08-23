@@ -1,0 +1,24 @@
+{
+    "mcpServers":{
+        "weather":{
+            "command":"python",
+            "args":["weather_server.py"],
+            "transport":"stdio"
+        },
+        "route":{
+            "command":"python",
+            "args":["route_server.py"],
+            "transport":"stdio"
+        },
+        "hotel":{
+            "command":"python",
+            "args":["hotel_server.py"],
+            "transport":"stdio"
+        },
+        "attraction":{
+            "command":"python",
+            "args":["attraction_server.py"],
+            "transport":"stdio"
+        }
+    }
+}
