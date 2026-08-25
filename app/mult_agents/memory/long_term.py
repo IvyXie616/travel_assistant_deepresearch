@@ -13,6 +13,7 @@ import jieba
 from langchain_community.embeddings import DashScopeEmbeddings
 
 from .base import BaseMemory, MemoryEntry, MemoryType
+from .summarizer import EpisodeSummarizer
 
 logger = logging.getLogger("travel_agents.memory")
 
@@ -129,6 +130,16 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
         self.ensure_db_directory()
         self.init_tables()
 
+        self.chroma_store = None
+        if api_key:
+            try:
+                from .vector_store import ChromaMemoryStore
+                chroma_dir = str(Path(__file__).resolve().parents[2] / "data" / "chroma")
+                self.chroma_store = ChromaMemoryStore(api_key=api_key, persist_dir=chroma_dir)
+                logger.info("Chroma 向量存储初始化成功，memory_type=%s", memory_type.value)
+            except Exception as e:
+                logger.warning("Chroma 初始化失败，降级为 SQLite BM25: %s", e)
+
     def ensure_db_directory(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -206,7 +217,42 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
                 embedding_str, created_at, entry.access_count,
             ))
             conn.commit()
+
+        # 6. 插入向量数据库
+        if isinstance(content, str) and self.chroma_store is not None:
+            try:
+                # 构造 Chroma metadata
+                chroma_metadata = {
+                    "user_id":entry.user_id or "",
+                    "namespace":entry.namespace or "",
+                    "memory_type":entry.memory_type.value
+                }
+                # 合并 entry.metadata 中的额外字段
+                if entry.metadata:
+                    for k, v in entry.metadata.items():
+                        if isinstance(v, (str, int, float, bool)):
+                            chroma_metadata[k] = v
+                # 写入 Chroma（doc_id = SQLite 的 memory id）
+                self.chroma_store.add(
+                    collection=self._get_chroma_collection_name(),
+                    doc_id=entry.id,
+                    text=content,
+                    metadata=chroma_metadata
+                )
+                logger.debug("Chroma 同步写入成功：id=%s", entry.id)
+            except Exception as e:
+                logger.warning("Chroma 同步写入失败（降级为 SQLite BM25）: %s", e)
         return entry.id
+    
+    def _get_chroma_collection_name(self) -> str:
+        """根据 memory_type 返回对应的 Chroma collection 名称。"""
+        from .vector_store import EPISODIC_COLLECTION, SEMANTIC_COLLECTION
+        if self.memory_type == MemoryType.EPISODIC:
+            return EPISODIC_COLLECTION
+        elif self.memory_type == MemoryType.SEMANTIC:
+            return SEMANTIC_COLLECTION
+        else:
+            return EPISODIC_COLLECTION  # 默认
 
     def get(self, memory_id: str) -> Optional[MemoryEntry]:
         """按 ID 查询单条记忆。"""
@@ -231,9 +277,52 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
 
         DashScope 不可用时（api_key 为空或网络故障），降级为纯 BM25。
         """
-        # 1. 生成查询向量（可能为空列表，降级为纯 BM25）
-        query_embedding = self.generate_embedding(query)
+        candidates:List[tuple[MemoryEntry, float]] = []
+        if self.chroma_store:
+            try:
+                where_conds = [{"memory_type":self.memory_type.value}]
+                if user_id:
+                    where_conds.append({"user_id":user_id})
+                if namespace:
+                    where_conds.append({"namespace":namespace})
+                
+                if len(where_conds) == 1:
+                    where = where_conds[0]
+                else:
+                    where = {"$and": where_conds}
+                
+                chroma_res = self.chroma_store.search_with_distance(
+                    collection=self._get_chroma_collection_name(),
+                    query=query,
+                    where=where,
+                    k=limit*4
+                )
 
+                for res in chroma_res:
+                    doc_id = res["metadata"].get("doc_id")
+                    score = 1 - res["distance"]
+                    if doc_id:
+                        entry = self.get(doc_id)
+                        if entry: candidates.append((entry, score))
+                logger.debug("Chroma 召回%d条候选",len(candidates))
+            except Exception as e:
+                logger.warning("Chroma检索失败，降级为纯BM25：%s",e)
+                candidates = []
+        
+        if candidates:
+            # 生成查询向量（可能为空列表，降级为纯 BM25）
+            total_scores = []
+
+            for entry,cos_score in candidates:
+                # 综合分数：向量 0.6 + BM25 0.4；DashScope 不可用时纯 BM25
+                bm25_norm = min(1.0, self.bm25_score(query, json.loads(entry.content)))
+                total = 0.6*cos_score + 0.4*bm25_norm
+                total_scores.append([entry, total])
+            
+            total_scores.sort(key = lambda x: -x[1])
+            return [x[0] for x in total_scores[:limit]]
+
+        # candidates无，降级到纯BM25检索
         # 2. 构建 SQL 条件
         conditions = ["memory_type = ?"]
         params: List[Any] = [self.memory_type.value]
@@ -251,32 +340,14 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
                 f"SELECT * FROM memories WHERE {where_clause}",
                 params
             ).fetchall()
-
-        # 4. 计算每行的综合分数
+        # 4. 计算每行的BM25分数
         scored = []
         for row in rows:
             entry = self.row_to_entry(row)
-
-            # 向量分数（DashScope 可用且有 embedding 时）
-            vec_score = 0.0
-            if query_embedding and row["embedding"]:
-                try:
-                    doc_embedding = json.loads(row["embedding"])
-                    vec_score = self.calculate_similarity(query_embedding, doc_embedding)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
             # BM25 分数（归一化到 [0,1]）
             bm25 = self.bm25_score(query, str(entry.content))
             bm25_norm = min(bm25, 1.0)
-
-            # 综合分数：向量 0.6 + BM25 0.4；DashScope 不可用时纯 BM25
-            if query_embedding:
-                total = vec_score * 0.6 + bm25_norm * 0.4
-            else:
-                total = bm25_norm
-
-            scored.append((entry, total))
+            scored.append((entry, bm25_norm))
 
         # 5. 按分数降序，取 top-limit
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -290,7 +361,18 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
                 (memory_id,)
             )
             conn.commit()
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
+
+        if success and self.chroma_store:
+            try:
+                self.chroma_store.delete(
+                    collection=self._get_chroma_collection_name(),
+                    doc_id=memory_id
+                )
+                logger.debug("Chroma同步删除成功：id=%s",memory_id)
+            except Exception as e:
+                logger.warning("Chroma同步删除失败：%s", e)
+        return success
 
     def clear(self, user_id: Optional[str] = None, namespace: Optional[str] = None) -> int:
         """批量清除记忆，返回清除数量。"""
@@ -310,7 +392,29 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
                 params
             )
             conn.commit()
-            return cursor.rowcount
+            count = cursor.rowcount
+
+        if count > 0 and self.chroma_store:
+            try:
+                chroma_where=[{"memory_type":self.memory_type.value}]
+                if user_id:
+                    chroma_where.append({"user_id":user_id})
+                if namespace:
+                    chroma_where.append({"namespace":namespace})
+                
+                if len(chroma_where) == 1:
+                    where = chroma_where[0]
+                else:
+                    where = {"$and": chroma_where}
+
+                self.chroma_store.delete_where(
+                    collection=self._get_chroma_collection_name(),
+                    where=where
+                )
+                logger.debug("Chroma同步删除成功：数量=%d",count)
+            except Exception as e:
+                logger.warning("Chroma同步删除失败：%s", e)
+        return count
 
     def list_namespaces(self, user_id: Optional[str] = None) -> List[str]:
         """列出所有命名空间（去重）。"""
@@ -398,31 +502,80 @@ class SemanticMemoryStore(SQLiteLongTermMemory):
         return self.save(entry)
     
 class EpisodicMemoryStore(SQLiteLongTermMemory):
-    """情景记忆：存储任务执行记录，支持历史查询和相似任务搜索。"""
+    """情景记忆：存储任务执行记录，支持历史查询和相似任务搜索。
+    
+    双写策略（方案 A）：
+    - dict content：结构化查询（不生成 embedding）
+    - str content：语义检索（生成 embedding）
+    """
     def __init__(self, db_path: Optional[str] = None, api_key: str = ""):
         super().__init__(MemoryType.EPISODIC, db_path, api_key)
+        self.summarizer = EpisodeSummarizer(api_key=api_key)
 
-    def save_task_record(self,user_id: str,task_type: str,task_data: Dict[str, Any],outcome: Optional[str] = None)-> str:
-        content ={
-            "task_type":task_type,
-            "data":task_data,
-            "outcome":outcome,
+    def save_task_record(self, user_id: str, task_type: str, task_data: Dict[str, Any], outcome: Optional[str] = None) -> str:
+        """保存任务记录（双写：结构化 + 语义摘要）。
+        
+        Returns:
+            语义摘要记录的 ID（str content 的 entry.id）
+        """
+        # 1. 存 dict content（结构化查询，不生成 embedding）
+        content_dict = {
+            "task_type": task_type,
+            "data": task_data,
+            "outcome": outcome,
             "timestamp": datetime.now().isoformat(),
         }
-        entry = MemoryEntry(
-            content=content,
+        entry_dict = MemoryEntry(
+            content=content_dict,
             memory_type=MemoryType.EPISODIC,
             user_id=user_id,
-            namespace=f"tasks/{task_type}",         # 如 "tasks/travel_plan"
+            namespace=f"tasks/{task_type}",
             metadata={
+                "type": "structured",
                 "task_type": task_type,
                 "has_outcome": outcome is not None,
             },
         )
-        return self.save(entry)
+        self.save(entry_dict)
+        
+        # 2. 生成摘要文本（用于语义检索）
+        summary = self.summarizer.summarize_by_rule(task_type, task_data, outcome)
+        
+        # 3. 存 str content（语义检索，生成 embedding）
+        entry_summary = MemoryEntry(
+            content=summary,  # str 类型，父类 save() 会自动生成 embedding
+            memory_type=MemoryType.EPISODIC,
+            user_id=user_id,
+            namespace=f"tasks/{task_type}/summary",
+            metadata={
+                "type": "summary",
+                "structured_id": entry_dict.id,  # 关联结构化记录
+                "task_type": task_type,
+            },
+        )
+        return self.save(entry_summary)
     
-    def get_similar_tasks(self, user_id:str, task_des:str, limit:int=5)-> List[MemoryEntry]:
-        return self.search(query=task_des,user_id=user_id,limit=limit)
+    def get_similar_tasks(self, user_id: str, task_des: str, limit: int = 5) -> List[MemoryEntry]:
+        """语义检索相似任务（优先搜索 summary 类型）。
+        
+        Args:
+            user_id: 用户 ID
+            task_des: 任务描述（用于语义检索）
+            limit: 返回 top-K 条
+        
+        Returns:
+            相似任务列表（summary 类型的 MemoryEntry）
+        """
+        # 搜索所有 namespace（summary 和 structured 都会返回）
+        results = self.search(
+            query=task_des,
+            user_id=user_id,
+            namespace=None,
+            limit=limit * 2  # 多取一些，过滤后可能不足 limit
+        )
+        # 过滤出 summary 类型（有 embedding，能用于语义检索）
+        summary_results = [r for r in results if r.metadata.get("type") == "summary"]
+        return summary_results[:limit]
     
     def get_task_history(self,user_id: str,task_type: Optional[str] = None,limit: int = 10) -> List[MemoryEntry]:
         # 1. 构造 namespace（可选）
